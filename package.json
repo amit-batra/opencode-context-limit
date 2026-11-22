@@ -12,7 +12,8 @@
     "test": "bun test"
   },
   "exports": {
-    ".": "./context-limit.ts"
+    ".": "./context-limit.ts",
+    "./server": "./context-limit.ts"
   },
   "files": [
     "context-limit.ts"

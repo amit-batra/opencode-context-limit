@@ -291,3 +291,12 @@ describe("hooks", () => {
     expect(fake.logs[0].service).toBe("context-limit")
   })
 })
+
+describe("package manifest", () => {
+  test("exposes a V1 server entrypoint", async () => {
+    const pkg = (await Bun.file(new URL("./package.json", import.meta.url)).json()) as {
+      exports: Record<string, string>
+    }
+    expect(pkg.exports["./server"]).toBe("./context-limit.ts")
+  })
+})
