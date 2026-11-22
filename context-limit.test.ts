@@ -53,7 +53,10 @@ function makeClient(model?: string) {
       ]
     : []
   const client: any = {
-    session: { messages: async () => ({ data: messages }) },
+    session: {
+      get: async () => ({ data: model ? { model: { providerID: model.split("/")[0], id: model.split("/").slice(1).join("/") } } : {} }),
+      messages: async () => ({ data: messages }),
+    },
     config: { get: async () => ({ data: { model } }) },
     tui: {
       showToast: async (options: any) => {
@@ -72,6 +75,13 @@ function makeClient(model?: string) {
 async function setup(model: string | null = DEFAULT_MODEL) {
   const fake = makeClient(model ?? undefined)
   const hooks: any = await (plugin as any)({ client: fake.client, directory: temp, project: {} })
+  return { ...fake, hooks }
+}
+
+async function setupWithConfig(provider: Record<string, any>, model: string = DEFAULT_MODEL) {
+  const fake = makeClient(model)
+  const hooks: any = await (plugin as any)({ client: fake.client, directory: temp, project: {} })
+  await hooks.config({ provider })
   return { ...fake, hooks }
 }
 
@@ -298,5 +308,80 @@ describe("package manifest", () => {
       exports: Record<string, string>
     }
     expect(pkg.exports["./server"]).toBe("./context-limit.ts")
+  })
+})
+
+describe("configured limits", () => {
+  const makeProvider = () => ({
+    opencode: { models: { "hy4-flash-free": { limit: { context: 230_000, output: 65_536 } } } },
+    ollama: { models: { "qwen3.8:27b-effort-low": { limit: { context: 72_000, output: 16_384 } } } },
+  })
+
+  test("reports the configured window instead of the catalog window", async () => {
+    const { hooks, toasts } = await setupWithConfig(makeProvider(), "opencode/hy4-flash-free")
+    await execute(hooks, "context-limit", "")
+    expect(toasts.at(-1).message).toContain("Model: opencode/hy4-flash-free")
+    expect(toasts.at(-1).message).toContain("Effective window: 230000")
+  })
+
+  test("clamps a percent rule to the configured window", async () => {
+    const { hooks, toasts } = await setupWithConfig(makeProvider(), "opencode/hy4-flash-free")
+    await execute(hooks, "context-limit", "50%")
+    await execute(hooks, "context-limit", "")
+    expect(toasts.at(-1).message).toContain("Effective window: 115000")
+  })
+
+  test("uses the session model instead of the last message's model", async () => {
+    const fake = makeClient("ollama/qwen3.8:27b-effort-low")
+    fake.client.session.messages = async () => ({
+      data: [
+        {
+          info: {
+            role: "user",
+            model: { providerID: "opencode-go", modelID: "deepseek-v4.1-flash" },
+          },
+        },
+      ],
+    })
+    const hooks: any = await (plugin as any)({ client: fake.client, directory: temp, project: {} })
+    await hooks.config({ provider: makeProvider() })
+    await execute(hooks, "context-limit", "")
+    expect(fake.toasts.at(-1).message).toContain("Model: ollama/qwen3.8:27b-effort-low")
+    expect(fake.toasts.at(-1).message).toContain("Effective window: 72000")
+  })
+
+  test("applies budgets to models defined only in config", async () => {
+    const first = await setupWithConfig(makeProvider(), "ollama/qwen3.8:27b-effort-low")
+    await execute(first.hooks, "context-limit", "50%")
+    const second = await setupWithConfig(makeProvider(), "ollama/qwen3.8:27b-effort-low")
+    const cfg: any = {}
+    await second.hooks.config(cfg)
+    expect(cfg.provider.ollama.models["qwen3.8:27b-effort-low"].limit.context).toBe(36_000)
+  })
+
+  test("caps output against the configured output limit", async () => {
+    const { hooks } = await setupWithConfig(makeProvider(), "ollama/qwen3.8:27b-effort-low")
+    await execute(hooks, "output-limit", "8K")
+    const output: any = { maxOutputTokens: 16_384 }
+    await hooks["chat.params"]({ model: { providerID: "ollama", id: "qwen3.8:27b-effort-low" } }, output)
+    expect(output.maxOutputTokens).toBe(8_000)
+  })
+
+  test("shows a configured model by explicit target", async () => {
+    const { hooks, toasts } = await setupWithConfig(makeProvider())
+    await execute(hooks, "context-limit", "opencode/hy4-flash-free")
+    expect(toasts.at(-1).message).toContain("Model: opencode/hy4-flash-free")
+    expect(toasts.at(-1).message).toContain("Effective window: 230000")
+  })
+
+  test("uses the model tracked from chat.message", async () => {
+    const { hooks, toasts } = await setupWithConfig(makeProvider(), "")
+    await hooks["chat.message"](
+      { sessionID: "ses_1" },
+      { message: { model: { providerID: "ollama", modelID: "qwen3.8:27b-effort-low" } } },
+    )
+    await execute(hooks, "context-limit", "")
+    expect(toasts.at(-1).message).toContain("Model: ollama/qwen3.8:27b-effort-low")
+    expect(toasts.at(-1).message).toContain("Effective window: 72000")
   })
 })

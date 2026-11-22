@@ -25,6 +25,12 @@ interface CatalogModel {
 }
 
 type Catalog = Record<string, { models?: Record<string, CatalogModel> }>
+type ModelLimit = NonNullable<CatalogModel["limit"]>
+
+function splitKey(key: string): [string, string] {
+  const slash = key.indexOf("/")
+  return slash < 0 ? [key, ""] : [key.slice(0, slash), key.slice(slash + 1)]
+}
 
 interface CommandOptions {
   kind: LimitKind
@@ -129,29 +135,18 @@ async function saveRules(rules: RuleSets): Promise<void> {
   await fs.writeFile(file, `${JSON.stringify(rules, null, 2)}\n`)
 }
 
-function catalogLimit(catalog: Catalog, key: string): CatalogModel["limit"] | undefined {
-  const slash = key.indexOf("/")
-  if (slash < 0) return undefined
-  const providerID = key.slice(0, slash)
-  const modelID = key.slice(slash + 1)
-  return catalog[providerID]?.models?.[modelID]?.limit
-}
-
-function applyBudgetToConfig(config: any, catalog: Catalog, rules: RuleSets): void {
-  for (const [providerID, provider] of Object.entries(catalog)) {
-    for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-      const key = `${providerID}/${modelID}`
-      const ceiling = model.limit
-      if (typeof ceiling?.context !== "number" || typeof ceiling.output !== "number") continue
-      const context = resolveBudget(rules.context, key, ceiling.context) ?? ceiling.context
-      const output = resolveBudget(rules.output, key, ceiling.output) ?? ceiling.output
-      if (context === ceiling.context && output === ceiling.output) continue
-      config.provider ??= {}
-      config.provider[providerID] ??= {}
-      config.provider[providerID].models ??= {}
-      config.provider[providerID].models[modelID] ??= {}
-      config.provider[providerID].models[modelID].limit = { context, output }
-    }
+function applyBudgetToConfig(config: any, limits: Map<string, ModelLimit>, rules: RuleSets): void {
+  for (const [key, ceiling] of limits) {
+    if (typeof ceiling.context !== "number" || typeof ceiling.output !== "number") continue
+    const context = resolveBudget(rules.context, key, ceiling.context) ?? ceiling.context
+    const output = resolveBudget(rules.output, key, ceiling.output) ?? ceiling.output
+    if (context === ceiling.context && output === ceiling.output) continue
+    const [providerID, modelID] = splitKey(key)
+    config.provider ??= {}
+    config.provider[providerID] ??= {}
+    config.provider[providerID].models ??= {}
+    config.provider[providerID].models[modelID] ??= {}
+    config.provider[providerID].models[modelID].limit = { context, output }
   }
 }
 
@@ -160,7 +155,19 @@ function describeRules(rules: Rule[]): string {
   return rules.map((rule) => `${rule.pattern} -> ${rule.unit === "percent" ? `${rule.value}%` : rule.value}`).join("\n")
 }
 
-async function currentModelKey(client: any, sessionID: string): Promise<string | undefined> {
+function sessionModelKey(result: any): string | undefined {
+  const session = result?.data ?? result
+  const model = session?.model
+  const id = model?.id ?? model?.modelID
+  return model?.providerID && id ? `${model.providerID}/${id}` : undefined
+}
+
+async function currentModelKey(client: any, sessionID: string, tracked?: string): Promise<string | undefined> {
+  if (tracked) return tracked
+  try {
+    const key = sessionModelKey(await client.session.get({ path: { sessionID } }))
+    if (key) return key
+  } catch {}
   try {
     const result = await client.session.messages({ path: { id: sessionID } })
     const messages: any[] = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : []
@@ -194,23 +201,29 @@ async function notify(client: any, title: string, message: string, variant: "inf
 async function runCommand(
   client: any,
   state: RuleSets,
-  catalog: Catalog,
+  limits: Map<string, ModelLimit>,
   opts: CommandOptions,
   input: { sessionID: string; arguments: string },
+  tracked?: string,
 ): Promise<void> {
   const text = (input.arguments ?? "").trim()
   const parts = text.split(/\s+/).filter(Boolean)
   let key: string | undefined
   let valueText = ""
+  let showOnly = false
 
   if (parts.length === 0) {
-    key = await currentModelKey(client, input.sessionID)
+    showOnly = true
+    key = await currentModelKey(client, input.sessionID, tracked)
+  } else if (parts.length === 1 && parts[0].includes("/") && !parseBudget(parts[0])) {
+    showOnly = true
+    key = parts[0]
   } else if (parts.length === 1) {
-    key = await currentModelKey(client, input.sessionID)
+    key = await currentModelKey(client, input.sessionID, tracked)
     valueText = parts[0]
   } else {
     valueText = parts.slice(1).join(" ")
-    key = parts[0] === "current" ? await currentModelKey(client, input.sessionID) : parts[0]
+    key = parts[0] === "current" ? await currentModelKey(client, input.sessionID, tracked) : parts[0]
   }
 
   if (!key) {
@@ -221,8 +234,8 @@ async function runCommand(
   const parsed = parseBudget(valueText)
   const clears = valueText === "0" || (parsed?.unit === "tokens" && parsed.value === 0)
 
-  if (parts.length === 0) {
-    const ceiling = catalogLimit(catalog, key)?.[opts.kind]
+  if (showOnly) {
+    const ceiling = limits.get(key)?.[opts.kind]
     const rule = longestMatch(state[opts.kind], key)
     const effective = resolveBudget(state[opts.kind], key, ceiling) ?? ceiling
     const budget = rule
@@ -277,10 +290,36 @@ async function runCommand(
 const plugin: Plugin = async ({ client }) => {
   const catalog = await loadCatalog()
   const state = await loadRules()
+  const limits = new Map<string, ModelLimit>()
+
+  for (const [providerID, provider] of Object.entries(catalog)) {
+    for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+      if (model.limit) limits.set(`${providerID}/${modelID}`, { ...model.limit })
+    }
+  }
+
+  let limitsCaptured = false
+  const trackedModels = new Map<string, string>()
 
   return {
+    "chat.message": async (input: any, output: any) => {
+      const model = output?.message?.model
+      const id = model?.modelID ?? model?.id
+      if (input?.sessionID && model?.providerID && id) {
+        trackedModels.set(input.sessionID, `${model.providerID}/${id}`)
+      }
+    },
     config: async (cfg: any) => {
-      applyBudgetToConfig(cfg, catalog, state)
+      if (!limitsCaptured) {
+        for (const [providerID, provider] of Object.entries(cfg.provider ?? {})) {
+          for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+            const key = `${providerID}/${modelID}`
+            limits.set(key, { ...(limits.get(key) ?? {}), ...(model.limit ?? {}) })
+          }
+        }
+        limitsCaptured = true
+      }
+      applyBudgetToConfig(cfg, limits, state)
       cfg.command ??= {}
       for (const opts of Object.values(COMMANDS)) {
         cfg.command[opts.name] = { template: "$ARGUMENTS", description: opts.description }
@@ -289,16 +328,15 @@ const plugin: Plugin = async ({ client }) => {
     "command.execute.before": async (input: any) => {
       const opts = COMMANDS[input.command]
       if (!opts) return
-      await runCommand(client, state, catalog, opts, {
+      await runCommand(client, state, limits, opts, {
         sessionID: input.sessionID,
         arguments: input.arguments ?? "",
-      })
+      }, trackedModels.get(input.sessionID))
       throw new Error(`${opts.name} handled`)
     },
     "chat.params": async (input: any, output: any) => {
       const key = `${input.model?.providerID}/${input.model?.id}`
-      const ceiling = catalogLimit(catalog, key)?.output
-      const budget = resolveBudget(state.output, key, ceiling)
+      const budget = resolveBudget(state.output, key, limits.get(key)?.output)
       if (budget === undefined) return
       const current = typeof output.maxOutputTokens === "number" ? output.maxOutputTokens : budget
       output.maxOutputTokens = Math.min(current, budget)
