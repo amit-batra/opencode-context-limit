@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
-const VERSION = "2026.11.4"
+const VERSION = "2026.11.5"
 
 type Unit = "tokens" | "percent"
 type LimitKind = "context" | "output"
