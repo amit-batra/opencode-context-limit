@@ -1,270 +1,293 @@
-import { describe, expect, test } from "bun:test"
-import plugin, { applyBudget, longestMatch, matchPattern, parseBudget, resolveBudget, VERSION } from "./context-limit.ts"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import plugin from "./context-limit.ts"
 
-function makeEditor(models: Array<{ providerID: string; id: string; context: number }>) {
-  const entries = models.map((model) => ({
-    providerID: model.providerID,
-    id: model.id,
-    limit: { context: model.context, output: 1000 },
-  }))
-  const editor: any = {
-    list: () => entries,
-    update: (providerID: string, modelID: string, change: (model: any) => void) => {
-      const model = entries.find((entry) => entry.providerID === providerID && entry.id === modelID)
-      if (model) change(model)
+const DEFAULT_MODEL = "opencode-go/deepseek-v4.1-flash"
+const catalog = {
+  "opencode-go": {
+    models: {
+      "deepseek-v4.1-flash": { id: "deepseek-v4.1-flash", limit: { context: 1_000_000, output: 32_000 } },
+      other: { id: "other", limit: { context: 200_000, output: 2000 } },
     },
-    entries,
-  }
-  return editor
+  },
+  deepseek: {
+    models: {
+      y: { id: "y", limit: { context: 1_000_000, output: 32_000 } },
+    },
+  },
 }
 
-function makeCtx(options: { model?: any; models?: any[] } = {}) {
-  const store = new Map<string, unknown>()
-  const commands: any[] = []
-  const transforms: any[] = []
-  let reloads = 0
-  const baseModels = (
-    options.models ?? [
-      { providerID: "opencode-go", id: "deepseek-v4.1-flash", limit: { context: 1_000_000, output: 1000 } },
-    ]
-  ).map((model) => structuredClone(model))
+let temp: string
 
-  // Rebuild the model list from the registered transforms on every read, the
-  // way the runtime replays transforms onto a fresh value.
-  const rebuild = () => {
-    const entries = structuredClone(baseModels)
-    const editor = {
-      list: () => entries,
-      update: (providerID: string, modelID: string, change: (model: any) => void) => {
-        const model = entries.find((entry) => entry.providerID === providerID && entry.id === modelID)
-        if (model) change(model)
+beforeEach(async () => {
+  temp = await fs.mkdtemp(path.join(os.tmpdir(), "context-limit-"))
+  const cache = path.join(temp, "cache", "opencode")
+  await fs.mkdir(cache, { recursive: true })
+  await fs.writeFile(path.join(cache, "models.json"), JSON.stringify(catalog))
+  process.env.XDG_CACHE_HOME = path.join(temp, "cache")
+  process.env.XDG_DATA_HOME = path.join(temp, "data")
+})
+
+afterEach(async () => {
+  delete process.env.XDG_CACHE_HOME
+  delete process.env.XDG_DATA_HOME
+  await fs.rm(temp, { recursive: true, force: true })
+})
+
+function makeClient(model?: string) {
+  const toasts: any[] = []
+  const logs: any[] = []
+  const messages = model
+    ? [
+        {
+          info: {
+            role: "user",
+            model: {
+              providerID: model.split("/")[0],
+              modelID: model.split("/").slice(1).join("/"),
+            },
+          },
+        },
+      ]
+    : []
+  const client: any = {
+    session: { messages: async () => ({ data: messages }) },
+    config: { get: async () => ({ data: { model } }) },
+    tui: {
+      showToast: async (options: any) => {
+        toasts.push(options.body)
       },
-    }
-    for (const transform of transforms) transform(editor)
-    return entries
+    },
+    app: {
+      log: async (options: any) => {
+        logs.push(options.body)
+      },
+    },
   }
-
-  const ctx: any = {
-    storage: {
-      get: async (key: string) => store.get(key),
-      set: async (key: string, value: unknown) => void store.set(key, value),
-    },
-    session: {
-      get: async () => ({ model: options.model ?? { providerID: "opencode-go", id: "deepseek-v4.1-flash" } }),
-    },
-    model: {
-      transform: async (callback: any) => void transforms.push(callback),
-      reload: async () => void (reloads += 1),
-      list: async () => ({ data: rebuild() }),
-    },
-    command: { transform: (callback: any) => callback({ add: (definition: any) => commands.push(definition) }) },
-  }
-  return { ctx, store, commands, transforms, reloads: () => reloads }
+  return { client, toasts, logs }
 }
 
-describe("parseBudget", () => {
-  test("parses scaled, plain, and percent values", () => {
-    expect(parseBudget("128K")).toEqual({ value: 128_000, unit: "tokens" })
-    expect(parseBudget("1M")).toEqual({ value: 1_000_000, unit: "tokens" })
-    expect(parseBudget("128000")).toEqual({ value: 128_000, unit: "tokens" })
-    expect(parseBudget("50%")).toEqual({ value: 50, unit: "percent" })
+async function setup(model: string | null = DEFAULT_MODEL) {
+  const fake = makeClient(model ?? undefined)
+  const hooks: any = await (plugin as any)({ client: fake.client, directory: temp, project: {} })
+  return { ...fake, hooks }
+}
+
+async function execute(
+  hooks: any,
+  name: string,
+  args: string,
+): Promise<any> {
+  await expect(
+    hooks["command.execute.before"]({ command: name, sessionID: "ses_1", arguments: args }, { parts: [] }),
+  ).rejects.toThrow(`${name} handled`)
+}
+
+describe("parseBudget through the command", () => {
+  test("accepts scaled, plain, and percent values", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "128K")
+    expect(toasts.at(-1).message).toContain("128K")
+    await execute(hooks, "context-limit", "50%")
+    expect(toasts.at(-1).message).toContain("50%")
+    await execute(hooks, "context-limit", "123456")
+    expect(toasts.at(-1).message).toContain("123456")
   })
 
-  test("rejects bad values", () => {
-    expect(parseBudget("")).toBeUndefined()
-    expect(parseBudget("abc")).toBeUndefined()
-    expect(parseBudget("0%")).toBeUndefined()
-    expect(parseBudget("101%")).toBeUndefined()
-  })
-})
-
-describe("matchPattern", () => {
-  test("matches exact, prefix, and star", () => {
-    expect(matchPattern("a/b", "a/b")).toBe(true)
-    expect(matchPattern("opencode-go/*", "opencode-go/x")).toBe(true)
-    expect(matchPattern("opencode-go/*", "opencode-go-x/y")).toBe(false)
-    expect(matchPattern("*", "anything/at-all")).toBe(true)
-    expect(matchPattern("a/b", "a/b/c")).toBe(false)
-  })
-})
-
-describe("longestMatch and resolveBudget", () => {
-  const rules = [
-    { pattern: "*", value: 500_000, unit: "tokens" as const },
-    { pattern: "opencode-go/*", value: 50, unit: "percent" as const },
-    { pattern: "opencode-go/deepseek-v4.1-flash", value: 128_000, unit: "tokens" as const },
-  ]
-
-  test("prefers the longest pattern", () => {
-    expect(longestMatch(rules, "opencode-go/deepseek-v4.1-flash")?.pattern).toBe("opencode-go/deepseek-v4.1-flash")
-    expect(longestMatch(rules, "opencode-go/other")?.pattern).toBe("opencode-go/*")
-    expect(longestMatch(rules, "deepseek/x")?.pattern).toBe("*")
-    expect(longestMatch(rules, "nope/nope/nope")?.pattern).toBe("*")
-    expect(longestMatch([{ pattern: "a/b", value: 1, unit: "tokens" }], "c/d")).toBeUndefined()
-  })
-
-  test("resolves a percent against the given window and clamps", () => {
-    expect(resolveBudget(rules, "opencode-go/other", 1_000_000)).toBe(500_000)
-    expect(resolveBudget(rules, "opencode-go/deepseek-v4.1-flash", 1_000_000)).toBe(128_000)
-    expect(resolveBudget(rules, "deepseek/x", 1_000_000)).toBe(500_000)
-    expect(resolveBudget([{ pattern: "*", value: 2_000_000, unit: "tokens" }], "a/b", 1_000_000)).toBe(1_000_000)
-    expect(resolveBudget([{ pattern: "a/b", value: 1, unit: "tokens" }], "c/d", 1_000_000)).toBeUndefined()
+  test("rejects bad values", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "101%")
+    expect(toasts.at(-1).variant).toBe("error")
+    expect(toasts.at(-1).message).toContain("Bad value")
+    await execute(hooks, "context-limit", "abc")
+    expect(toasts.at(-1).variant).toBe("error")
   })
 })
 
-describe("applyBudget", () => {
-  test("lowers only matched models", () => {
-    const editor = makeEditor([
-      { providerID: "opencode-go", id: "x", context: 1_000_000 },
-      { providerID: "deepseek", id: "y", context: 1_000_000 },
+describe("rule storage", () => {
+  test("sets a budget for the current model and persists it", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "128K")
+    expect(toasts.at(-1).message).toContain("opencode-go/deepseek-v4.1-flash")
+    expect(toasts.at(-1).message).toContain("Restart OpenCode")
+
+    const stored = JSON.parse(await fs.readFile(path.join(temp, "data", "opencode", "context-limit", "rules.json"), "utf8"))
+    expect(stored.context).toEqual([
+      { pattern: DEFAULT_MODEL, value: 128_000, unit: "tokens" },
     ])
-    applyBudget(editor, [{ pattern: "opencode-go/*", value: 128_000, unit: "tokens" }])
-    const byKey = Object.fromEntries(editor.entries.map((entry: any) => [`${entry.providerID}/${entry.id}`, entry.limit.context]))
-    expect(byKey["opencode-go/x"]).toBe(128_000)
-    expect(byKey["deepseek/y"]).toBe(1_000_000)
+    expect(stored.output).toEqual([])
   })
 
-  test("does nothing without rules", () => {
-    const editor = makeEditor([{ providerID: "a", id: "b", context: 1000 }])
-    applyBudget(editor, [])
-    expect(editor.entries[0].limit.context).toBe(1000)
-  })
-})
-
-describe("applyBudget output", () => {
-  test("lowers only the output limit for matched models", () => {
-    const editor = makeEditor([
-      { providerID: "opencode-go", id: "x", context: 1_000_000 },
-      { providerID: "deepseek", id: "y", context: 1_000_000 },
+  test("sets a pattern and percent, then clears it with 0", async () => {
+    const { hooks } = await setup()
+    await execute(hooks, "context-limit", "opencode-go/* 50%")
+    const file = path.join(temp, "data", "opencode", "context-limit", "rules.json")
+    expect(JSON.parse(await fs.readFile(file, "utf8")).context).toEqual([
+      { pattern: "opencode-go/*", value: 50, unit: "percent" },
     ])
-    applyBudget(editor, [{ pattern: "opencode-go/*", value: 512, unit: "tokens" }], "output")
-    const byKey = Object.fromEntries(
-      editor.entries.map((entry: any) => [`${entry.providerID}/${entry.id}`, entry.limit.output]),
-    )
-    expect(byKey["opencode-go/x"]).toBe(512)
-    expect(byKey["deepseek/y"]).toBe(1000)
+    await execute(hooks, "context-limit", "opencode-go/* 0")
+    expect(JSON.parse(await fs.readFile(file, "utf8")).context).toEqual([])
   })
 
-  test("clamps an output rule to the catalog output ceiling", () => {
-    const editor = makeEditor([{ providerID: "a", id: "b", context: 1_000_000 }])
-    applyBudget(editor, [{ pattern: "*", value: 999_999, unit: "tokens" }], "output")
-    expect(editor.entries[0].limit.output).toBe(1000)
+  test("clears with 0K and keeps context and output rules separate", async () => {
+    const { hooks } = await setup()
+    await execute(hooks, "output-limit", "16K")
+    await execute(hooks, "context-limit", "128K")
+    await execute(hooks, "context-limit", `${DEFAULT_MODEL} 0K`)
+    const file = path.join(temp, "data", "opencode", "context-limit", "rules.json")
+    const stored = JSON.parse(await fs.readFile(file, "utf8"))
+    expect(stored.context).toEqual([])
+    expect(stored.output).toEqual([{ pattern: DEFAULT_MODEL, value: 16_000, unit: "tokens" }])
   })
 
-  test("skips a model without the target limit field", () => {
-    const editor: any = {
-      list: () => [{ providerID: "a", id: "b", limit: { context: 1000 } }],
-      update: () => {
-        throw new Error("update should not run")
-      },
-    }
-    applyBudget(editor, [{ pattern: "*", value: 100, unit: "tokens" }], "output")
-  })
-})
-
-describe("command", () => {
-  const run = (commands: any[], text: string) => commands[0].execute({ sessionID: "ses_1", prompt: { text } })
-
-  test("sets a budget for the current model", async () => {
-    const { ctx, store, commands, reloads } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "128K")
-    expect(store.get("context-limit")).toEqual([{ pattern: "opencode-go/deepseek-v4.1-flash", value: 128_000, unit: "tokens" }])
-    expect(reloads()).toBe(1)
-  })
-
-  test("sets a pattern and percent, then clears it", async () => {
-    const { ctx, store, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "opencode-go/* 50%")
-    expect(store.get("context-limit")).toEqual([{ pattern: "opencode-go/*", value: 50, unit: "percent" }])
-    await run(commands, "opencode-go/* 0")
-    expect(store.get("context-limit")).toEqual([])
-    await run(commands, "opencode-go/* 50%")
-    await run(commands, "opencode-go/* 0K")
-    expect(store.get("context-limit")).toEqual([])
-  })
-
-  test("shows the current model and the rules", async () => {
-    const { ctx, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "128K")
-    await expect(run(commands, "")).rejects.toThrow(/Effective window: 128000/)
-    await expect(run(commands, "")).rejects.toThrow(/Budget: 128000/)
-    await expect(run(commands, "")).rejects.toThrow(/opencode-go\/deepseek-v4.1-flash/)
-  })
-
-  test("reports a percent rule without applying it twice", async () => {
-    const { ctx, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "50%")
-    await expect(run(commands, "")).rejects.toThrow(/Effective window: 500000/)
-    await expect(run(commands, "")).rejects.toThrow(/Budget: 50%/)
-  })
-
-  test("clamps a token rule in the display", async () => {
-    const { ctx, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "2M")
-    await expect(run(commands, "")).rejects.toThrow(/Effective window: 1000000/)
-    await expect(run(commands, "")).rejects.toThrow(/Budget: 1000000/)
-  })
-
-  test("rejects a bad value", async () => {
-    const { ctx, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await expect(run(commands, "not a value")).rejects.toThrow(/bad value/)
+  test("restores rules saved by an earlier instance", async () => {
+    const first = await setup()
+    await execute(first.hooks, "context-limit", "128K")
+    const second = await setup()
+    await execute(second.hooks, "context-limit", "")
+    expect(second.toasts.at(-1).message).toContain("Budget: 128000")
   })
 })
 
-describe("output-limit command", () => {
-  const run = (commands: any[], text: string) => {
-    const command = commands.find((entry: any) => entry.name === "output-limit")
-    return command.execute({ sessionID: "ses_1", prompt: { text } })
-  }
-
-  test("sets an output budget for the current model", async () => {
-    const { ctx, store, commands, reloads } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "16K")
-    expect(store.get("output-limit")).toEqual([
-      { pattern: "opencode-go/deepseek-v4.1-flash", value: 16_000, unit: "tokens" },
-    ])
-    expect(reloads()).toBe(1)
+describe("show command", () => {
+  test("shows the current model, effective window, and rules", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "128K")
+    await execute(hooks, "context-limit", "")
+    const message = toasts.at(-1).message
+    expect(message).toContain(`Model: ${DEFAULT_MODEL}`)
+    expect(message).toContain("Effective window: 128000")
+    expect(message).toContain("Budget: 128000")
+    expect(message).toContain(`${DEFAULT_MODEL} -> 128000`)
   })
 
-  test("keeps output rules separate from context rules", async () => {
-    const { ctx, store, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "16K")
-    expect(store.get("context-limit")).toBeUndefined()
+  test("reports a percent rule without reapplying it", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "50%")
+    await execute(hooks, "context-limit", "")
+    const message = toasts.at(-1).message
+    expect(message).toContain("Effective window: 500000")
+    expect(message).toContain("Budget: 50%")
   })
 
-  test("shows the current model and effective output", async () => {
-    const { ctx, commands } = makeCtx()
-    await (plugin as any).setup(ctx)
-    await run(commands, "512")
-    await expect(run(commands, "")).rejects.toThrow(/Effective output: 512/)
+  test("clamps a rule above the catalog window in the display", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "2M")
+    await execute(hooks, "context-limit", "")
+    expect(toasts.at(-1).message).toContain("Effective window: 1000000")
+    expect(toasts.at(-1).message).toContain("Budget: 1000000")
   })
-})
 
-describe("setup", () => {
-  test("registers both commands and a transform that uses stored rules", async () => {
-    const { ctx, store, commands, transforms } = makeCtx()
-    await store.set("context-limit", [{ pattern: "opencode-go/*", value: 128_000, unit: "tokens" }])
-    await (plugin as any).setup(ctx)
-    expect(commands.map((entry) => entry.name)).toEqual(["context-limit", "output-limit"])
-    expect(transforms).toHaveLength(1)
-
-    const editor = makeEditor([{ providerID: "opencode-go", id: "x", context: 1_000_000 }])
-    transforms[0](editor)
-    expect(editor.entries[0].limit.context).toBe(128_000)
+  test("shows the output budget separately", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "output-limit", "512")
+    await execute(hooks, "output-limit", "")
+    expect(toasts.at(-1).message).toContain("Effective output: 512")
   })
-})
 
-describe("version", () => {
-  test("VERSION matches package.json", async () => {
+  test("prints the version", async () => {
+    const { hooks, toasts } = await setup()
+    await execute(hooks, "context-limit", "")
     const pkg = (await Bun.file(new URL("./package.json", import.meta.url)).json()) as { version: string }
-    expect(VERSION).toBe(pkg.version)
+    expect(toasts.at(-1).message).toContain(`context-limit ${pkg.version}`)
+  })
+
+  test("reports an unresolvable model", async () => {
+    const { hooks, toasts } = await setup(null)
+    await execute(hooks, "context-limit", "")
+    expect(toasts.at(-1).message).toContain("Could not resolve the current model")
+  })
+})
+
+describe("config hook", () => {
+  test("registers both commands", async () => {
+    const { hooks } = await setup()
+    const cfg: any = {}
+    await hooks.config(cfg)
+    expect(Object.keys(cfg.command)).toEqual(["context-limit", "output-limit"])
+    expect(cfg.command["context-limit"].description).toContain("context budget")
+    expect(cfg.command["output-limit"].description).toContain("output")
+  })
+
+  test("applies stored budgets to matched models only", async () => {
+    const first = await setup()
+    await execute(first.hooks, "context-limit", "opencode-go/* 128K")
+    await execute(first.hooks, "output-limit", "* 16K")
+
+    const second = await setup()
+    const cfg: any = {}
+    await second.hooks.config(cfg)
+    const models = cfg.provider["opencode-go"].models
+    expect(models["deepseek-v4.1-flash"].limit).toEqual({ context: 128_000, output: 16_000 })
+    expect(models.other.limit).toEqual({ context: 128_000, output: 2000 })
+    expect(cfg.provider.deepseek.models.y.limit).toEqual({ context: 1_000_000, output: 16_000 })
+  })
+
+  test("never raises a catalog limit", async () => {
+    const first = await setup()
+    await execute(first.hooks, "context-limit", "2M")
+    await execute(first.hooks, "output-limit", "16K")
+
+    const second = await setup()
+    const cfg: any = {}
+    await second.hooks.config(cfg)
+    expect(cfg.provider["opencode-go"].models["deepseek-v4.1-flash"].limit).toEqual({
+      context: 1_000_000,
+      output: 16_000,
+    })
+  })
+
+  test("does not add provider config without rules", async () => {
+    const { hooks } = await setup()
+    const cfg: any = {}
+    await hooks.config(cfg)
+    expect(cfg.provider).toBeUndefined()
+  })
+})
+
+describe("chat.params hook", () => {
+  test("lowers maxOutputTokens for the current model", async () => {
+    const { hooks } = await setup()
+    await execute(hooks, "output-limit", "16K")
+    const output: any = { maxOutputTokens: 32_000 }
+    await hooks["chat.params"]({ model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" } }, output)
+    expect(output.maxOutputTokens).toBe(16_000)
+  })
+
+  test("leaves unmatched models alone", async () => {
+    const { hooks } = await setup()
+    await execute(hooks, "output-limit", DEFAULT_MODEL + " 16K")
+    const output: any = { maxOutputTokens: 32_000 }
+    await hooks["chat.params"]({ model: { providerID: "deepseek", id: "y" } }, output)
+    expect(output.maxOutputTokens).toBe(32_000)
+  })
+
+  test("never raises maxOutputTokens", async () => {
+    const { hooks } = await setup()
+    await execute(hooks, "output-limit", "16K")
+    const output: any = { maxOutputTokens: 100 }
+    await hooks["chat.params"]({ model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" } }, output)
+    expect(output.maxOutputTokens).toBe(100)
+  })
+})
+
+describe("hooks", () => {
+  test("ignores other commands", async () => {
+    const { hooks, toasts } = await setup()
+    await hooks["command.execute.before"]({ command: "other", sessionID: "ses_1", arguments: "" }, { parts: [] })
+    expect(toasts).toHaveLength(0)
+  })
+
+  test("falls back to app.log when there is no TUI", async () => {
+    const fake = makeClient(DEFAULT_MODEL)
+    delete fake.client.tui
+    const hooks: any = await (plugin as any)({ client: fake.client, directory: temp, project: {} })
+    await expect(
+      hooks["command.execute.before"]({ command: "context-limit", sessionID: "ses_1", arguments: "" }, { parts: [] }),
+    ).rejects.toThrow("context-limit handled")
+    expect(fake.logs).toHaveLength(1)
+    expect(fake.logs[0].service).toBe("context-limit")
   })
 })

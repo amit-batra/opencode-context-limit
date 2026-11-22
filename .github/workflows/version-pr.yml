@@ -1,0 +1,45 @@
+name: Bump version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Bump patch version and sync plugin constant
+        run: |
+          npm version patch --no-git-tag-version
+          node scripts/sync-version.mjs
+
+      - name: Open or update the release PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automation/bump-version
+          delete-branch: true
+          commit-message: 'chore: bump version for next release'
+          title: 'chore: bump version for next release'
+          labels: release
+          body: |
+            Automated patch bump after the latest push to `main`.
+
+            You may edit this PR to choose a different version number:
+
+            1. Set `version` in `package.json`.
+            2. Run `node scripts/sync-version.mjs` to copy it into the
+               `VERSION` constant in `context-limit.ts`.
+
+            Merging this PR publishes the package to npm via `publish.yml`.

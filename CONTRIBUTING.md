@@ -5,7 +5,7 @@ Thanks for helping improve opencode-context-limit.
 ## Setup
 
 ```sh
-git clone https://github.com/jadmadi/opencode-context-limit
+git clone https://github.com/amit-batra/opencode-context-limit
 cd opencode-context-limit
 bun test
 ```
@@ -15,11 +15,12 @@ inside OpenCode, which embeds Bun.
 
 ## Rules
 
-- Import `{ Plugin } from "@opencode/plugin"` and export
-  `Plugin.define({ id, setup })`. The host provides the module at runtime; do
-  not add it as a package dependency. Tests stub it in `test-preload.ts`.
+- Use the V1 API: `import type { Plugin } from "@opencode-ai/plugin"` and
+  default-export one plugin function that returns hooks. Do not add runtime
+  dependencies, and do not add named exports to `context-limit.ts`.
 - A budget can only lower a window, never raise it.
-- Add a test for any behavior you change. Tests use a fake catalog.
+- Add a test for any behavior you change. Tests use a fake client and catalog
+  in temporary XDG directories.
 
 ## Sending a change
 

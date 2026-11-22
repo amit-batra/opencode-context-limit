@@ -1,17 +1,9 @@
-// OpenCode V2 context-limit / output-limit plugin.
-//
-// Sets a working context budget and a max output-token budget per model by
-// lowering the model's `limit.context` / `limit.output` through a model
-// transform. Compaction's default threshold follows the model's usable input
-// budget, so a lower context window makes compaction fire earlier. A budget
-// only ever lowers a value, never raises it.
-//
-// The host provides @opencode/plugin at runtime, so this file uses
-// Plugin.define.
+import type { Plugin } from "@opencode-ai/plugin"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 
-import { Plugin } from "@opencode/plugin"
-
-const VERSION = "2026.10.2"
+const VERSION = "2026.11.0"
 
 type Unit = "tokens" | "percent"
 type LimitKind = "context" | "output"
@@ -20,6 +12,40 @@ interface Rule {
   pattern: string
   value: number
   unit: Unit
+}
+
+interface RuleSets {
+  context: Rule[]
+  output: Rule[]
+}
+
+interface CatalogModel {
+  id?: string
+  limit?: { context?: number; input?: number; output?: number }
+}
+
+type Catalog = Record<string, { models?: Record<string, CatalogModel> }>
+
+interface CommandOptions {
+  kind: LimitKind
+  name: string
+  fieldLabel: "window" | "output"
+  description: string
+}
+
+const COMMANDS: Record<string, CommandOptions> = {
+  "context-limit": {
+    kind: "context",
+    name: "context-limit",
+    fieldLabel: "window",
+    description: "Show or set a working context budget per model",
+  },
+  "output-limit": {
+    kind: "output",
+    name: "output-limit",
+    fieldLabel: "output",
+    description: "Show or set a max output token budget per model",
+  },
 }
 
 function parseBudget(text: string): { value: number; unit: Unit } | undefined {
@@ -59,168 +85,225 @@ function budgetFor(rule: Rule, catalogCeiling: number): number {
   return Math.max(1, Math.min(raw, catalogCeiling))
 }
 
-function resolveBudget(rules: Rule[], key: string, catalogCeiling: number): number | undefined {
+function resolveBudget(rules: Rule[], key: string, catalogCeiling: number | undefined): number | undefined {
+  if (typeof catalogCeiling !== "number") return undefined
   const rule = longestMatch(rules, key)
   return rule ? budgetFor(rule, catalogCeiling) : undefined
 }
 
-// The model transform body. `editor` is a model editor: it exposes
-// list() and update(providerID, modelID, change). `kind` picks which `limit`
-// field is lowered, context or output.
-function applyBudget(editor: any, rules: Rule[], kind: LimitKind = "context"): void {
-  if (rules.length === 0) return
-  for (const model of editor.list()) {
-    const ceiling = model.limit?.[kind]
-    if (typeof ceiling !== "number") continue
-    const key = `${model.providerID}/${model.id}`
-    const budget = resolveBudget(rules, key, ceiling)
-    if (budget === undefined) continue
-    editor.update(model.providerID, model.id, (entry: any) => {
-      entry.limit = { ...entry.limit, [kind]: budget }
-    })
+function catalogPath(): string {
+  if (process.env.OPENCODE_MODELS_PATH) return process.env.OPENCODE_MODELS_PATH
+  const cacheHome = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")
+  return path.join(cacheHome, "opencode", "models.json")
+}
+
+function rulesPath(): string {
+  const dataHome = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share")
+  return path.join(dataHome, "opencode", "context-limit", "rules.json")
+}
+
+async function loadCatalog(): Promise<Catalog> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(catalogPath(), "utf8"))
+    return parsed && typeof parsed === "object" ? parsed : {}
+  } catch {
+    return {}
   }
 }
 
-async function loadRules(ctx: any, storageKey: string): Promise<Rule[]> {
-  const stored = await ctx.storage.get(storageKey)
-  return Array.isArray(stored) ? (stored as Rule[]) : []
+async function loadRules(): Promise<RuleSets> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(rulesPath(), "utf8"))
+    return {
+      context: Array.isArray(parsed?.context) ? parsed.context : [],
+      output: Array.isArray(parsed?.output) ? parsed.output : [],
+    }
+  } catch {
+    return { context: [], output: [] }
+  }
 }
 
-async function saveRules(ctx: any, storageKey: string, rules: Rule[]): Promise<void> {
-  await ctx.storage.set(storageKey, rules)
+async function saveRules(rules: RuleSets): Promise<void> {
+  const file = rulesPath()
+  await fs.mkdir(path.dirname(file), { recursive: true })
+  await fs.writeFile(file, `${JSON.stringify(rules, null, 2)}\n`)
 }
 
-async function modelLimit(ctx: any, key: string, kind: LimitKind): Promise<number | undefined> {
-  const result = await ctx.model.list()
-  const data: any[] = Array.isArray(result) ? result : (result?.data ?? [])
-  const found = data.find((model) => `${model.providerID}/${model.id}` === key)
-  return found?.limit?.[kind]
+function catalogLimit(catalog: Catalog, key: string): CatalogModel["limit"] | undefined {
+  const slash = key.indexOf("/")
+  if (slash < 0) return undefined
+  const providerID = key.slice(0, slash)
+  const modelID = key.slice(slash + 1)
+  return catalog[providerID]?.models?.[modelID]?.limit
+}
+
+function applyBudgetToConfig(config: any, catalog: Catalog, rules: RuleSets): void {
+  for (const [providerID, provider] of Object.entries(catalog)) {
+    for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+      const key = `${providerID}/${modelID}`
+      const ceiling = model.limit
+      if (typeof ceiling?.context !== "number" || typeof ceiling.output !== "number") continue
+      const context = resolveBudget(rules.context, key, ceiling.context) ?? ceiling.context
+      const output = resolveBudget(rules.output, key, ceiling.output) ?? ceiling.output
+      if (context === ceiling.context && output === ceiling.output) continue
+      config.provider ??= {}
+      config.provider[providerID] ??= {}
+      config.provider[providerID].models ??= {}
+      config.provider[providerID].models[modelID] ??= {}
+      config.provider[providerID].models[modelID].limit = { context, output }
+    }
+  }
 }
 
 function describeRules(rules: Rule[]): string {
   if (rules.length === 0) return "No rules."
-  return rules
-    .map((rule) => `${rule.pattern} -> ${rule.unit === "percent" ? `${rule.value}%` : rule.value}`)
-    .join("\n")
+  return rules.map((rule) => `${rule.pattern} -> ${rule.unit === "percent" ? `${rule.value}%` : rule.value}`).join("\n")
 }
 
-interface CommandOptions {
-  kind: LimitKind
-  name: string
-  storageKey: string
-  fieldLabel: "window" | "output"
-  description: string
+async function currentModelKey(client: any, sessionID: string): Promise<string | undefined> {
+  try {
+    const result = await client.session.messages({ path: { id: sessionID } })
+    const messages: any[] = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : []
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const model = messages[i]?.info?.model
+      if (model?.providerID && model?.modelID) return `${model.providerID}/${model.modelID}`
+    }
+  } catch {}
+  try {
+    const result = await client.config.get()
+    const model = result?.data?.model ?? result?.model
+    if (typeof model === "string" && model.includes("/")) return model
+  } catch {}
+  return undefined
 }
 
-// Builds a `/context-limit` or `/output-limit` command. `state` is shared with
-// the model transform so rule edits apply on the next `ctx.model.reload()`.
-function makeCommand(ctx: any, state: { context: Rule[]; output: Rule[] }, opts: CommandOptions) {
-  const { kind, name, storageKey, fieldLabel, description } = opts
+async function notify(client: any, title: string, message: string, variant: "info" | "success" | "error" = "info") {
+  try {
+    if (typeof client.tui?.showToast === "function") {
+      await client.tui.showToast({ body: { title, message, variant, duration: 10000 } })
+      return
+    }
+  } catch {}
+  try {
+    await client.app?.log?.({
+      body: { service: "context-limit", level: variant === "error" ? "error" : "info", message },
+    })
+  } catch {}
+}
+
+async function runCommand(
+  client: any,
+  state: RuleSets,
+  catalog: Catalog,
+  opts: CommandOptions,
+  input: { sessionID: string; arguments: string },
+): Promise<void> {
+  const text = (input.arguments ?? "").trim()
+  const parts = text.split(/\s+/).filter(Boolean)
+  let key: string | undefined
+  let valueText = ""
+
+  if (parts.length === 0) {
+    key = await currentModelKey(client, input.sessionID)
+  } else if (parts.length === 1) {
+    key = await currentModelKey(client, input.sessionID)
+    valueText = parts[0]
+  } else {
+    valueText = parts.slice(1).join(" ")
+    key = parts[0] === "current" ? await currentModelKey(client, input.sessionID) : parts[0]
+  }
+
+  if (!key) {
+    await notify(client, opts.name, "Could not resolve the current model.", "error")
+    return
+  }
+
+  const parsed = parseBudget(valueText)
+  const clears = valueText === "0" || (parsed?.unit === "tokens" && parsed.value === 0)
+
+  if (parts.length === 0) {
+    const ceiling = catalogLimit(catalog, key)?.[opts.kind]
+    const rule = longestMatch(state[opts.kind], key)
+    const effective = resolveBudget(state[opts.kind], key, ceiling) ?? ceiling
+    const budget = rule
+      ? rule.unit === "percent"
+        ? `${rule.value}%`
+        : String(Math.min(rule.value, ceiling ?? rule.value))
+      : "none"
+    await notify(
+      client,
+      opts.name,
+      [
+        `Model: ${key}`,
+        `Effective ${opts.fieldLabel}: ${effective ?? "unknown"}`,
+        `Budget: ${budget}`,
+        "",
+        describeRules(state[opts.kind]),
+        `${opts.name} ${VERSION}`,
+      ].join("\n"),
+    )
+    return
+  }
+
+  if (clears) {
+    state[opts.kind] = state[opts.kind].filter((rule) => rule.pattern !== key)
+    await saveRules(state)
+    await notify(
+      client,
+      opts.name,
+      `Cleared ${opts.kind} budget for ${key}. Restart OpenCode to apply.`,
+      "success",
+    )
+    return
+  }
+
+  if (!parsed || (parsed.unit === "tokens" && parsed.value <= 0)) {
+    await notify(client, opts.name, `Bad value "${valueText}"; use 128000, 128K, 1M, or 50% (0 clears).`, "error")
+    return
+  }
+
+  state[opts.kind] = state[opts.kind].filter((rule) => rule.pattern !== key)
+  state[opts.kind].push({ pattern: key, value: parsed.value, unit: parsed.unit })
+  await saveRules(state)
+  const restart = opts.kind === "context" ? " Restart OpenCode to apply." : ""
+  await notify(
+    client,
+    opts.name,
+    `Set ${opts.kind} budget for ${key} to ${valueText}.${restart}`,
+    "success",
+  )
+}
+
+const plugin: Plugin = async ({ client }) => {
+  const catalog = await loadCatalog()
+  const state = await loadRules()
+
   return {
-    name,
-    description,
-    execute: async ({ sessionID, prompt }: any) => {
-      const text = typeof prompt?.text === "string" ? prompt.text.trim() : ""
-
-      if (!text) {
-        const info: any = await ctx.session.get({ sessionID }).catch(() => undefined)
-        const model = info?.model ?? info?.data?.model
-        const key = model ? `${model.providerID}/${model.id}` : undefined
-        const current = key ? await modelLimit(ctx, key, kind) : undefined
-        const rule = key ? longestMatch(state[kind], key) : undefined
-        const budget = rule
-          ? rule.unit === "percent"
-            ? `${rule.value}%`
-            : String(Math.min(rule.value, current ?? rule.value))
-          : "none"
-        throw new Error(
-          [
-            key ? `Model: ${key}` : "Model: unknown",
-            `${fieldLabel === "window" ? "Effective window" : "Effective output"}: ${current ?? "unknown"}`,
-            `Budget: ${budget}`,
-            "",
-            describeRules(state[kind]),
-            `${name} ${VERSION}`,
-          ].join("\n"),
-        )
+    config: async (cfg: any) => {
+      applyBudgetToConfig(cfg, catalog, state)
+      cfg.command ??= {}
+      for (const opts of Object.values(COMMANDS)) {
+        cfg.command[opts.name] = { template: "$ARGUMENTS", description: opts.description }
       }
-
-      const parts = text.split(/\s+/)
-      let pattern: string
-      let valueText: string
-      if (parts.length === 1) {
-        const info: any = await ctx.session.get({ sessionID }).catch(() => undefined)
-        const model = info?.model ?? info?.data?.model
-        if (!model) throw new Error("could not resolve the current model")
-        pattern = `${model.providerID}/${model.id}`
-        valueText = parts[0]
-      } else {
-        const target = parts[0]
-        valueText = parts.slice(1).join(" ")
-        if (target === "current") {
-          const info: any = await ctx.session.get({ sessionID }).catch(() => undefined)
-          const model = info?.model ?? info?.data?.model
-          if (!model) throw new Error("could not resolve the current model")
-          pattern = `${model.providerID}/${model.id}`
-        } else {
-          pattern = target
-        }
-      }
-
-      const parsed = parseBudget(valueText)
-      const clears = valueText === "0" || (parsed?.unit === "tokens" && parsed.value === 0)
-      if (clears) {
-        state[kind] = state[kind].filter((rule) => rule.pattern !== pattern)
-        await saveRules(ctx, storageKey, state[kind])
-        await ctx.model.reload()
-        return
-      }
-      if (!parsed || (parsed.unit === "tokens" && parsed.value <= 0)) {
-        throw new Error(`bad value "${valueText}"; use 128000, 128K, 1M, or 50% (0 clears)`)
-      }
-      state[kind] = state[kind].filter((rule) => rule.pattern !== pattern)
-      state[kind].push({ pattern, value: parsed.value, unit: parsed.unit })
-      await saveRules(ctx, storageKey, state[kind])
-      await ctx.model.reload()
+    },
+    "command.execute.before": async (input: any) => {
+      const opts = COMMANDS[input.command]
+      if (!opts) return
+      await runCommand(client, state, catalog, opts, {
+        sessionID: input.sessionID,
+        arguments: input.arguments ?? "",
+      })
+      throw new Error(`${opts.name} handled`)
+    },
+    "chat.params": async (input: any, output: any) => {
+      const key = `${input.model?.providerID}/${input.model?.id}`
+      const ceiling = catalogLimit(catalog, key)?.output
+      const budget = resolveBudget(state.output, key, ceiling)
+      if (budget === undefined) return
+      const current = typeof output.maxOutputTokens === "number" ? output.maxOutputTokens : budget
+      output.maxOutputTokens = Math.min(current, budget)
     },
   }
 }
 
-const plugin = Plugin.define({
-  id: "context-limit",
-  async setup(ctx: any) {
-    const state = {
-      context: await loadRules(ctx, "context-limit"),
-      output: await loadRules(ctx, "output-limit"),
-    }
-
-    await ctx.model.transform((editor: any) => {
-      applyBudget(editor, state.context, "context")
-      applyBudget(editor, state.output, "output")
-    })
-
-    await ctx.command.transform((editor: any) => {
-      editor.add(
-        makeCommand(ctx, state, {
-          kind: "context",
-          name: "context-limit",
-          storageKey: "context-limit",
-          fieldLabel: "window",
-          description: "Show or set a working context budget per model",
-        }),
-      )
-      editor.add(
-        makeCommand(ctx, state, {
-          kind: "output",
-          name: "output-limit",
-          storageKey: "output-limit",
-          fieldLabel: "output",
-          description: "Show or set a max output token budget per model",
-        }),
-      )
-    })
-  },
-})
-
-export { applyBudget, budgetFor, longestMatch, matchPattern, parseBudget, resolveBudget, VERSION }
 export default plugin

@@ -1,10 +1,13 @@
 {
   "name": "opencode-context-limit",
-  "version": "2026.10.2",
-  "builtUnder": "2.1.4",
-  "description": "OpenCode V2 plugin that sets a per-model working context and max output token budget",
+  "version": "2026.11.0",
+  "builtUnder": "1.19.6",
+  "description": "OpenCode V1 plugin that sets a per-model working context and max output token budget",
   "type": "module",
   "license": "AGPL-3.0-only",
+  "engines": {
+    "opencode": "^1.0.0"
+  },
   "scripts": {
     "test": "bun test"
   },
@@ -22,6 +25,6 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jadmadi/opencode-context-limit.git"
+    "url": "git+https://github.com/amit-batra/opencode-context-limit.git"
   }
 }
